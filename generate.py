@@ -27,6 +27,9 @@ def tier_of(cp):
 BROKER = ["iad","safti","capifrance","capi france","propriétés privées","proprietes privees","proprietes-privees",
  "megagence","méga agence","dr house","effity","efficity","welmo","sextant","optimhome","optim home",
  "noovimo","expertimo","3g immo","la fourmi","mandataire","bsk immo","i particuliers","immo mandataire","le bon agent"]
+# certains réseaux de mandataires passent par l'IDENTIFIANT de l'annonce, pas le nom d'agence
+BROKER_ID = ["iad-","safti","capifrance","capi-","megagence","optimhome","noovimo","expertimo","3gimmo",
+ "proprietes-privees","bskimmo","dr-house","welmo","sextant"]
 # mots de description = fonds / cession -> EXCLURE (sauf vente de murs claire)
 CESSION = re.compile(r"cession|droit au bail|fonds de commerce|pas de porte|cède\s+(?:le\s+)?bail|céder\s+(?:le\s+)?bail", re.I)
 MURS = re.compile(r"\bmurs?\b", re.I)
@@ -85,27 +88,39 @@ SSREG = re.compile(r"sous[- ]sol|réserve|cave", re.I)
 
 def clean(t): return re.sub(r"<[^>]+>"," ", t or "").replace("\n"," ")
 
-def estimate_rent(cp, surf, desc):
-    """retourne (type, loyer_annuel, yield%) — réel si trouvé, sinon estimé."""
+def size_factor(surf):
+    """loyer/m² dégressif sur les grandes surfaces (une grande surface se loue moins cher au m²)."""
+    if surf>500: return 0.40
+    if surf>250: return 0.50
+    if surf>120: return 0.65
+    return 1.0
+
+def grid_estimate(cp, surf, desc):
+    """loyer annuel estimé pur (grille secteur), avec ventilation sous-sol et dégressivité surface."""
     d = desc
-    m = RENTAB_RE.search(d)
-    mr = RENT_RE.search(d)
-    if mr:
-        val = int(re.sub(r"[ .]","",mr.group(1)) or 0)
-        if 100 <= val <= 6000:      # mensuel probable
-            val *= 12
-        if 3000 <= val <= 2000000:
-            return ("R", val)
-    if m:
-        return ("A", None, float(m.group(1).replace(",",".")))
-    # estimation
     eff = surf
-    if SSREG.search(d) and not RDCTOK.search(d):
-        eff = surf*0.5
-    elif SSREG.search(d):
-        eff = surf*0.8
-    loyer = round(obs_rent(cp)*eff)
-    return ("E", loyer)
+    if SSREG.search(d) and not RDCTOK.search(d): eff = surf*0.5
+    elif SSREG.search(d):                        eff = surf*0.8
+    return round(obs_rent(cp)*eff*size_factor(surf))
+
+def detect_real(desc):
+    """retourne ('R',loyer_annuel) ou ('A',pct) ou None. Gère décimales et périodicité (mensuel/trimestriel/annuel)."""
+    d = desc
+    m = re.search(r"loyer\s*(annuel|mensuel|trimestriel|/?\s*mois|/?\s*an|/?\s*trimestre)?[^0-9]{0,25}?([0-9][0-9 .,]*[0-9]|[0-9])\s*(?:€|euros?|eur\b)", d, re.I)
+    if m:
+        period=(m.group(1) or "").lower(); raw=m.group(2)
+        dec=re.search(r"[.,](\d{2})$", raw)               # décimale = exactement 2 chiffres en fin
+        num=re.sub(r"[ .,]","",raw); val=int(num) if num else 0
+        if dec: val//=100                                  # retire les centimes
+        if "mensuel" in period or "mois" in period:   val*=12
+        elif "trimestr" in period:                    val*=4
+        elif "annuel" in period or "an" in period:    pass
+        else:
+            if 100<=val<=6000: val*=12                     # sans période : petit montant => mensuel probable
+        if 3000<=val<=2000000: return ("R", val)
+    m2 = RENTAB_RE.search(d)
+    if m2: return ("A", float(m2.group(1).replace(",",".")))
+    return None
 
 def classify(idv, desc, cp, surf, price):
     if idv in EXPO_OVERRIDE: return EXPO_OVERRIDE[idv]
@@ -125,7 +140,9 @@ def conversion(sub, cp, surf, price):
     pxm2,loyerm2 = res
     resale=round(pxm2*surf*decote); marge=resale-allin; margep=marge/allin
     loyer=round(loyerm2*12*surf*occ); rdt=loyer/allin
-    if margep>=0.12 or rdt>=0.06: v,t="OUI","Coût de revient nettement sous la valeur logement du secteur : conversion a priori rentable."
+    if margep>0.60:  # marge invraisemblable -> prix/surface atypiques (donnée douteuse), pas de verdict OUI
+        v,t="?","Prix ou surface atypiques (marge théorique très élevée) — donnée à vérifier avant toute conclusion."
+    elif margep>=0.12 or rdt>=0.06: v,t="OUI","Coût de revient nettement sous la valeur logement du secteur : conversion a priori rentable."
     elif margep>=0.0: v,t="LIMITE","Marge faible : rentable seulement si travaux maîtrisés et bon prix d'achat négocié."
     else: v,t="NON","Achat + travaux ≥ valeur logement du secteur : conversion non rentable en l'état."
     return dict(sub=sub,reno=reno,allin=allin,resale=resale,marge=marge,margep=round(margep*100),
@@ -163,8 +180,20 @@ def process(ad):
     crd=ad.get("contactRelativeData") or {}
     agency=(crd.get("agencyNameToDisplay") or "").strip()
     al=agency.lower()
+    idl=(idv or "").lower()
+    # --- filtres STRUCTURÉS (fiables) ---
+    acct=(crd.get("accountType") or "").lower()
+    if acct in ("mandatary","mandataire"): return None          # exclut TOUS les mandataires (IAD, Propriétés Privées, Capifrance…)
+    adt=(ad.get("adType") or "").lower()
+    adfr=(ad.get("adTypeFR") or "").lower()
+    if adt and adt!="buy": return None                          # exclut businessTakeOver (fonds de commerce)
+    if "fond" in adfr or "cession" in adfr: return None
+    # --- filtres par nom / identifiant (complément) ---
     if any(b in al for b in BROKER): return None
+    if any(b in idl for b in BROKER_ID): return None
     desc=clean(ad.get("description",""))
+    # --- fonds / bail dans le texte ---
+    if re.search(r"fonds de commerce|droit au bail", desc, re.I): return None
     if CESSION.search(desc) and not MURS.search(desc): return None
     ppm2=ad.get("pricePerSquareMeter") or round(price/surf)
     ph=(ad.get("photos") or [])
@@ -174,18 +203,24 @@ def process(ad):
     # coefficient de loyer selon le type de bien (un entrepôt/une cave se loue bien moins qu'une vitrine)
     FACTOR={"entrepot":0.35,"cave":0.30,"bureaux":0.70,"etage":0.55,"cour":0.85,"rdc-res":0.80,"appart":0.60,"rue":1.0}
     # loyer
+    def gridloyer():
+        return round(grid_estimate(cp,surf,desc)*FACTOR.get(bucket,1.0))
     if idv in RENT_OVERRIDE:
         ntyp,loyer=RENT_OVERRIDE[idv]; ny=round(loyer/price*100,1)
     else:
-        est=estimate_rent(cp,surf,desc)
-        if est[0]=="A":
-            ntyp="A"; ny=est[2]; loyer=round(ny/100*price)
+        r=detect_real(desc)
+        if r and r[0]=="R":
+            ntyp,loyer="R",r[1]; ny=round(loyer/price*100,1)
+        elif r and r[0]=="A":
+            ntyp,ny="A",r[1]; loyer=round(ny/100*price)
         else:
-            ntyp,loyer=est[0],est[1]
-            if ntyp=="E":
-                loyer=round(loyer*FACTOR.get(bucket,1.0))   # ajuste selon le type
-            ny=round(loyer/price*100,1)
-    improbable=is_rue and ntyp in ("E","E+") and ny>11.5
+            ntyp,loyer="E",gridloyer(); ny=round(loyer/price*100,1)
+    # garde-fous de plausibilité
+    if ntyp in ("R","A") and ny>18:      # loyer réel/annoncé implausible -> lecture erronée : on ré-estime
+        ntyp,loyer="E",gridloyer(); ny=round(loyer/price*100,1)
+    if ny>22:                            # aberrant même après ré-estimation -> écarté
+        return None
+    improbable=is_rue and ny>11.5
     conv=None if is_rue else conversion(bucket,cp,surf,price)
     tl={"R":"Loyer réel","A":"Rendement annoncé","E":"Estimé"}.get(ntyp,"Estimé")
     tc={"R":"reel","A":"annonce"}.get(ntyp,"est")
@@ -210,8 +245,7 @@ def main():
     sys.stderr.write(f"[info] total retenu: {len(rows)}\n")
     if len(rows) < 8:
         sys.stderr.write("[error] trop peu d'annonces — on NE remplace PAS le site existant.\n")
-        sys.exit(1)   # garde-fou : ne publie pas un site vide si Bien'ici bloque
-
+        sys.exit(1)
     rows.sort(key=lambda x:(0 if x["is_rue"] else 1, x["improbable"], -x["ny"]))
     rue=[x for x in rows if x["is_rue"]]; log=[x for x in rows if not x["is_rue"]]
     VR={"OUI":0,"LIMITE":1,"NON":2,"?":3}
