@@ -1,0 +1,43 @@
+name: PACT — mise à jour quotidienne du site
+
+on:
+  schedule:
+    - cron: "10 6 * * *"   # ~08h10 Paris (été) / 07h10 (hiver) — tous les jours
+  workflow_dispatch:        # bouton "Run workflow" pour lancer à la main
+
+permissions:
+  contents: write           # autorise l'action à republier index.html (jeton intégré, aucun PAT requis)
+
+concurrency:
+  group: pact-daily
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Régénérer le site (scan Bien'ici)
+        run: python generate.py
+        env:
+          PACT_MAXPAGES: "8"
+
+      - name: Publier si le site a changé
+        run: |
+          if [ -n "$(git status --porcelain index.html)" ]; then
+            git config user.name  "PACT bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add index.html
+            git commit -m "MàJ auto du site — $(date +'%Y-%m-%d %H:%M')"
+            git push
+            echo "Site republié."
+          else
+            echo "Aucun changement."
+          fi
